@@ -92,6 +92,15 @@ voice:
   voice_name: "Your chosen voice"
   voice_id: YOUR_ELEVENLABS_VOICE_ID
   output_format: pcm_16000
+  # Optional on-device TTS fallback. Used when ElevenLabs has no usable key +
+  # voice_id (otherwise text-only). Piper runs on CPU; not a cloned voice.
+  #   pip install piper-tts onnxruntime   (onnxruntime>=1.23 for macOS x86_64)
+  #   download a voice from https://huggingface.co/rhasspy/piper-voices
+  # local:
+  #   engine: piper
+  #   model: models/de_DE-thorsten-high.onnx
+  #   espeak_data_dir: /usr/local/share/espeak-ng-data   # if piper's bundled data is missing
+  #   sample_rate_out: 16000
 
 persona:                     # used only by the anthropic fallback path
   system_prompt: >

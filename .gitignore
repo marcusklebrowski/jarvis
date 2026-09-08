@@ -8,6 +8,15 @@ server/hud/audio/
 server/hud/jarvis.cer
 server/hud/weather-config.json
 
+# local TTS models (large binaries, fetched from rhasspy/piper-voices)
+server/models/
+
+# local runtime state & manual backups
+server/backups/
+server/run/
+server/*.upstream-*
+server/hud/demo/
+
 # worker local files
 worker/run-stt.bat
 worker/stt_server.log
