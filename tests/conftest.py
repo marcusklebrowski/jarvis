@@ -1,7 +1,7 @@
 """Shared pytest fixtures + heavy-dependency stubs for the Jarvis test suite.
 
 The voice server imports several heavyweight, hardware-bound packages
-(``RealtimeSTT`` pulls in Whisper/torch, ``anthropic`` the cloud SDK, ``uvicorn``
+(``faster_whisper`` pulls in CTranslate2, ``anthropic`` the cloud SDK, ``uvicorn``
 the ASGI runner). None of them are needed to exercise the HTTP/WebSocket surface
 or the pure security-relevant helpers, so we install lightweight stand-ins into
 ``sys.modules`` *before* importing ``server.py``. This keeps the tests fast,
@@ -25,25 +25,20 @@ SERVER_PY = REPO_ROOT / "server" / "server.py"
 # Stub the heavy imports before loading server.py                              #
 # --------------------------------------------------------------------------- #
 def _install_stubs() -> None:
-    if "RealtimeSTT" not in sys.modules:
-        rt = types.ModuleType("RealtimeSTT")
+    if "faster_whisper" not in sys.modules:
+        fw = types.ModuleType("faster_whisper")
 
-        class _Recorder:  # minimal stand-in for AudioToTextRecorder
+        class _WhisperModel:  # minimal stand-in for faster_whisper.WhisperModel
             def __init__(self, *a, **k):
                 self._args = a
                 self._kwargs = k
 
-            def feed_audio(self, *a, **k):
-                return None
+            def transcribe(self, *a, **k):
+                info = types.SimpleNamespace(language="en", language_probability=1.0)
+                return iter(()), info  # no segments
 
-            def perform_final_transcription(self, *a, **k):
-                return ""
-
-            def clear_audio_queue(self, *a, **k):
-                return None
-
-        rt.AudioToTextRecorder = _Recorder
-        sys.modules["RealtimeSTT"] = rt
+        fw.WhisperModel = _WhisperModel
+        sys.modules["faster_whisper"] = fw
 
     if "anthropic" not in sys.modules:
         an = types.ModuleType("anthropic")

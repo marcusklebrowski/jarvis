@@ -821,26 +821,47 @@ def _warn_tts_unconfigured(has_key: bool, voice_id: object) -> None:
 _PIPELINE_LOCK = threading.Lock()
 
 _PIPER_VOICE = None            # piper.PiperVoice, lazily loaded on first local TTS
+_PIPER_LOAD_FAILED: str | None = None  # cached hard failure — don't re-attempt every turn
 _PIPER_LOCK = threading.Lock()
 
 
 def _get_piper_voice(local: dict):
     """Load the Piper ONNX voice once and reuse it. ~150-250 MB RSS, ~1-2 s the
-    first time; never loads unless local TTS is actually used."""
-    global _PIPER_VOICE
-    if _PIPER_VOICE is None:
-        with _PIPER_LOCK:
-            if _PIPER_VOICE is None:
-                from piper import PiperVoice
-                model_path = Path(local["model"])
-                if not model_path.is_absolute():
-                    model_path = ROOT / model_path
-                kwargs = {}
-                if local.get("espeak_data_dir"):
-                    kwargs["espeak_data_dir"] = local["espeak_data_dir"]
-                print(f"Loading Piper TTS voice {model_path.name} ...", flush=True)
-                _PIPER_VOICE = PiperVoice.load(str(model_path), **kwargs)
-                print("Piper TTS voice ready.", flush=True)
+    first time; never loads unless local TTS is actually used. A hard load
+    failure (missing package, missing/corrupt model, missing espeak data) is
+    cached so every later turn fails fast with a clear message instead of
+    re-incurring the 1-2 s load attempt each time."""
+    global _PIPER_VOICE, _PIPER_LOAD_FAILED
+    if _PIPER_VOICE is not None:
+        return _PIPER_VOICE
+    if _PIPER_LOAD_FAILED is not None:
+        raise RuntimeError(f"Piper TTS unavailable: {_PIPER_LOAD_FAILED}")
+    with _PIPER_LOCK:
+        if _PIPER_VOICE is not None:
+            return _PIPER_VOICE
+        if _PIPER_LOAD_FAILED is not None:
+            raise RuntimeError(f"Piper TTS unavailable: {_PIPER_LOAD_FAILED}")
+        try:
+            from piper import PiperVoice
+            model_path = Path(local["model"])
+            if not model_path.is_absolute():
+                model_path = ROOT / model_path
+            if not model_path.exists():
+                raise FileNotFoundError(f"Piper model not found: {model_path}")
+            kwargs = {}
+            if local.get("espeak_data_dir"):
+                kwargs["espeak_data_dir"] = local["espeak_data_dir"]
+            print(f"Loading Piper TTS voice {model_path.name} ...", flush=True)
+            _PIPER_VOICE = PiperVoice.load(str(model_path), **kwargs)
+            print("Piper TTS voice ready.", flush=True)
+        except Exception as exc:
+            _PIPER_LOAD_FAILED = f"{type(exc).__name__}: {exc}"
+            print(
+                f"Piper TTS load failed — local TTS disabled for this process: "
+                f"{_PIPER_LOAD_FAILED}",
+                flush=True,
+            )
+            raise
     return _PIPER_VOICE
 
 
@@ -1677,13 +1698,19 @@ def _maybe_schedule_partial(ws: WebSocket, pipeline: VoicePipelineServer, conn: 
         return
     buf = b"".join(conn.audio_chunks)
     min_new = int(16000 * 2 * float(stt_cfg.get("partial_interval", 1.2)))
-    if len(buf) < 16000 or len(buf) - conn.last_partial_bytes < min_new or len(buf) > 16000 * 2 * 30:
+    if len(buf) < 16000 or len(buf) - conn.last_partial_bytes < min_new:
         return
     conn.last_partial_bytes = len(buf)
+    # Partials are a throwaway live hint. Decode only the trailing window instead
+    # of the whole growing buffer, so cost stays flat rather than O(n^2) as the
+    # utterance grows (direct faster-whisper keeps no incremental state). The
+    # final transcription at `stop` still sees the full audio.
+    window = int(16000 * 2 * float(stt_cfg.get("partial_window_seconds", 15)))
+    chunk = buf[-window:] if len(buf) > window else buf
 
     async def run() -> None:
         try:
-            text = await pipeline.transcribe(buf)
+            text = await pipeline.transcribe(chunk)
             if text and conn.recording:
                 await ws.send_json({"type": "partial_transcript", "text": text})
         except Exception:
@@ -1716,7 +1743,16 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                             "type": "status",
                             "message": "Loading local speech recognition..."
                         })
-                        pipeline = await asyncio.to_thread(get_pipeline)
+                        try:
+                            pipeline = await asyncio.to_thread(get_pipeline)
+                        except Exception as exc:
+                            # Model init failed (bad stt.model, no disk, CT2 error).
+                            # Keep the socket alive — typed chat needs no STT — and
+                            # let a later `start` retry.
+                            print(f"STT pipeline init failed: {exc}", flush=True)
+                            await ws.send_json({"type": "error", "message":
+                                f"Speech recognition failed to load: {exc}"})
+                            continue
                     await _cancel_active_turn(ws, pipeline, conn)  # barge-in
                     if event.get("conversation"):
                         conn.conversation = str(event["conversation"])

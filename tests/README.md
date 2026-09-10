@@ -1,7 +1,7 @@
 # Jarvis test suite
 
 Fast, offline tests for the voice/HUD server. Heavy runtime deps
-(RealtimeSTT/whisper, anthropic, uvicorn) are **stubbed** in
+(faster-whisper, anthropic, uvicorn) are **stubbed** in
 [`conftest.py`](conftest.py), so the suite needs no GPU, no cloud keys, and
 never touches the network.
 

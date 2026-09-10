@@ -37,6 +37,9 @@ stt:
   sample_rate: 16000
   partials: true            # live transcript while speaking
   partial_interval: 1.2     # seconds of new audio between partial passes
+  partial_window_seconds: 15  # partial passes decode only this trailing window
+  #                           # (keeps cost flat on long utterances; the final
+  #                           # transcription still sees the whole recording)
   max_utterance_seconds: 120  # hard cap on one spoken turn; the turn is forced
   #                           # to process at this length so a client cannot pin
   #                           # a CPU core by streaming unbounded audio.
