@@ -37,6 +37,9 @@ stt:
   sample_rate: 16000
   partials: true            # live transcript while speaking
   partial_interval: 1.2     # seconds of new audio between partial passes
+  max_utterance_seconds: 120  # hard cap on one spoken turn; the turn is forced
+  #                           # to process at this length so a client cannot pin
+  #                           # a CPU core by streaming unbounded audio.
   # Optional GPU worker (worker/stt_server.py on any NVIDIA machine):
   # big-model accuracy at ~0.2s. Falls back to the local model automatically.
   # remote:
@@ -97,6 +100,10 @@ voice:
   voice_name: "Your chosen voice"
   voice_id: YOUR_ELEVENLABS_VOICE_ID
   output_format: pcm_16000
+  # text_only: true          # run with no speech output on purpose. Without this,
+  #                          # a turn that finds no usable TTS backend logs a
+  #                          # one-time "TTS NOT CONFIGURED" warning and flags the
+  #                          # turn, instead of silently playing nothing.
   # Optional on-device TTS fallback. Used when ElevenLabs has no usable key +
   # voice_id (otherwise text-only). Piper runs on CPU; not a cloned voice.
   #   pip install piper-tts onnxruntime   (onnxruntime>=1.23 for macOS x86_64)

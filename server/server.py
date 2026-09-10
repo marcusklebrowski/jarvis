@@ -483,21 +483,47 @@ class VoicePipelineServer:
 
     # ------------------------------------------------------------------ TTS
 
+    def _tts_key(self) -> str | None:
+        return (
+            os.environ.get("ELEVENLABS_API_KEY")
+            or os.environ.get("ELEVEN_API_KEY")
+            or os.environ.get("XI_API_KEY")
+        )
+
+    def tts_backend(self) -> str:
+        """Which TTS path this turn will take: 'elevenlabs' | 'piper' |
+        'text-only' (deliberate) | 'unconfigured' (probably a mistake)."""
+        voice = self.cfg["voice"]
+        vid = voice.get("voice_id")
+        if self._tts_key() and vid and vid not in ("NOT_CONFIGURED", "YOUR_ELEVENLABS_VOICE_ID", ""):
+            return "elevenlabs"
+        local = voice.get("local") or {}
+        if local.get("engine") == "piper" and local.get("model"):
+            return "piper"
+        return "text-only" if voice.get("text_only") else "unconfigured"
+
     def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
         """Yield 16 kHz mono int16 PCM for `text`. ElevenLabs when it has a
         usable key + voice_id, else local Piper when configured, else nothing
         (text-only mode)."""
         voice = self.cfg["voice"]
-        key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY") or os.environ.get("XI_API_KEY")
-        eleven_ready = bool(key) and voice.get("voice_id") and voice["voice_id"] != "NOT_CONFIGURED"
-        if eleven_ready:
-            yield from self._tts_elevenlabs(text, timing, key)
+        backend = self.tts_backend()
+        if backend == "elevenlabs":
+            yield from self._tts_elevenlabs(text, timing, self._tts_key())
             return
-        local = voice.get("local") or {}
-        if local.get("engine") == "piper" and local.get("model"):
-            yield from self._tts_piper(text, timing, local)
+        if backend == "piper":
+            yield from self._tts_piper(text, timing, voice["local"])
             return
-        # Text-only mode until TTS is configured.
+        # No audio this turn. Make it visible instead of a silent no-op: the HUD
+        # otherwise shows "speaking" and plays nothing, and the turn log looks
+        # like a normal spoken turn.
+        if backend == "text-only":
+            timing.tts_model = timing.tts_model or "none:text-only"
+        else:
+            timing.tts_model = timing.tts_model or "none:unconfigured"
+            if "tts_unconfigured" not in timing.errors:
+                timing.errors.append("tts_unconfigured")
+            _warn_tts_unconfigured(bool(self._tts_key()), voice.get("voice_id"))
         return
 
     def _tts_elevenlabs(self, text: str, timing: TurnTiming, key: str) -> Iterator[bytes]:
@@ -589,6 +615,14 @@ class VoicePipelineServer:
         full_response: list[str] = []
         spoken = False
         await ws.send_json({"type": "agent_status", "state": "thinking"})
+
+        backend = self.tts_backend()
+        if backend in ("text-only", "unconfigured"):
+            await ws.send_json({"type": "status", "message": (
+                "Text-only mode - no speech output configured."
+                if backend == "unconfigured"
+                else "Text-only mode."
+            )})
 
         q: asyncio.Queue = asyncio.Queue()
         tts_lock = asyncio.Lock()  # serialise ack vs real sentences (no interleaved PCM)
@@ -755,6 +789,33 @@ load_env()
 CFG = load_config()
 HERMES = HermesAPI(CFG)   # lightweight API client - independent of the STT pipeline
 PIPELINE: VoicePipelineServer | None = None
+
+# Hard ceiling on a single spoken turn. Without it a client can stream unbounded
+# PCM and pin a CPU core in Whisper (STT is serialised on one worker). 16 kHz
+# mono int16 = 32000 bytes/s.
+MAX_UTTERANCE_SECONDS = float((CFG.get("stt") or {}).get("max_utterance_seconds", 120))
+MAX_UTTERANCE_BYTES = int(16000 * 2 * MAX_UTTERANCE_SECONDS)
+
+_TTS_UNCONFIGURED_WARNED = False
+
+
+def _warn_tts_unconfigured(has_key: bool, voice_id: object) -> None:
+    """Log once per process when a turn produced no speech because no TTS
+    backend is usable — as opposed to a deliberate `voice.text_only: true`."""
+    global _TTS_UNCONFIGURED_WARNED
+    if _TTS_UNCONFIGURED_WARNED:
+        return
+    _TTS_UNCONFIGURED_WARNED = True
+    reason = (
+        f"ElevenLabs key is set but voice.voice_id is missing/placeholder ({voice_id!r})"
+        if has_key else
+        "no ElevenLabs API key and no voice.local.engine=piper configured"
+    )
+    print(
+        f"TTS NOT CONFIGURED - running TEXT-ONLY: {reason}. "
+        "Set voice.text_only: true to make this the intended mode and silence this warning.",
+        flush=True,
+    )
 
 
 _PIPELINE_LOCK = threading.Lock()
@@ -1164,6 +1225,7 @@ async def speak_broadcast(text: str, *, priority: str = "normal", panel: dict | 
             loop.call_soon_threadsafe(q.put_nowait, exc)
 
     worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    audio_bytes = 0
     try:
         while True:
             item = await q.get()
@@ -1171,6 +1233,7 @@ async def speak_broadcast(text: str, *, priority: str = "normal", panel: dict | 
                 break
             if isinstance(item, Exception):
                 raise item
+            audio_bytes += len(item)
             await _broadcast_bytes(item)
         await worker_task
     finally:
@@ -1179,6 +1242,10 @@ async def speak_broadcast(text: str, *, priority: str = "normal", panel: dict | 
         timing.total_done_monotonic = time.perf_counter()
         await _broadcast_json({"type": "speak_end", "id": spk_id})
         pipeline.log_turn(timing)
+    if audio_bytes == 0:
+        # No TTS backend produced audio - don't claim we spoke.
+        return {"spoke": False, "sent_to": n, "chars": len(clean),
+                "reason": timing.tts_model or "no tts audio produced"}
     return {"spoke": True, "id": spk_id, "sent_to": n, "chars": len(clean)}
 
 
@@ -1519,6 +1586,7 @@ async def dash_http_proxy(path: str, request: Request) -> Response:
 @dataclass
 class ConnState:
     audio_chunks: list = field(default_factory=list)
+    audio_bytes: int = 0        # running size of audio_chunks this turn (cap guard)
     recording: bool = False
     timing: TurnTiming | None = None
     turn_task: asyncio.Task | None = None
@@ -1535,6 +1603,10 @@ async def _run_turn(ws: WebSocket, pipeline: VoicePipelineServer, conn: ConnStat
     assert timing is not None
     audio = b"".join(conn.audio_chunks)
     conn.audio_chunks = []
+    conn.audio_bytes = 0
+    if len(audio) > MAX_UTTERANCE_BYTES:  # defence in depth; the WS handler also caps
+        audio = audio[:MAX_UTTERANCE_BYTES]
+        timing.errors.append(f"audio truncated to {MAX_UTTERANCE_SECONDS:.0f}s")
     try:
         transcript = await pipeline.transcribe(audio, timing)
         timing.transcript = transcript
@@ -1649,6 +1721,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     if event.get("conversation"):
                         conn.conversation = str(event["conversation"])
                     conn.audio_chunks = []
+                    conn.audio_bytes = 0
                     conn.last_partial_bytes = 0
                     conn.recording = True
                     conn.timing = TurnTiming(turn_id=pipeline.next_turn_id())
@@ -1659,6 +1732,8 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     if conn.timing is None:
                         await ws.send_json({"type": "error", "message": "Received stop before start."})
                         continue
+                    if conn.turn_task and not conn.turn_task.done():
+                        continue  # turn already running (e.g. max-utterance cap fired)
                     conn.recording = False
                     conn.timing.end_of_speech_monotonic = time.perf_counter()
                     conn.turn_task = asyncio.create_task(_run_turn(ws, pipeline, conn))
@@ -1683,7 +1758,18 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             elif "bytes" in message and message["bytes"] is not None:
                 if conn.recording:
                     conn.audio_chunks.append(message["bytes"])
-                    _maybe_schedule_partial(ws, pipeline, conn)
+                    conn.audio_bytes += len(message["bytes"])
+                    if conn.audio_bytes >= MAX_UTTERANCE_BYTES:
+                        # Force the turn instead of buffering without bound.
+                        conn.recording = False
+                        conn.timing.end_of_speech_monotonic = time.perf_counter()
+                        await ws.send_json({"type": "status", "message": (
+                            f"Max utterance length ({MAX_UTTERANCE_SECONDS:.0f}s) reached "
+                            "- processing what was captured."
+                        )})
+                        conn.turn_task = asyncio.create_task(_run_turn(ws, pipeline, conn))
+                    else:
+                        _maybe_schedule_partial(ws, pipeline, conn)
     except WebSocketDisconnect:
         if conn.turn_task and not conn.turn_task.done():
             conn.turn_task.cancel()
