@@ -90,6 +90,8 @@ def test_full_turn_happy_path(fake_pipeline_client):
         assert ws.receive_json()["type"] == "status"  # connected banner
         ws.send_json({"type": "start", "sample_rate": 16000,
                       "format": "pcm_s16le", "channels": 1})
+        # First `start` lazily loads the STT pipeline and announces it.
+        assert ws.receive_json()["message"] == "Loading local speech recognition..."
         assert ws.receive_json()["message"].startswith("Turn 1 recording")
         ws.send_bytes(b"\x00\x01" * 1600)  # ~0.1s of audio while recording
         ws.send_json({"type": "stop"})

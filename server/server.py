@@ -22,7 +22,6 @@ and approval events. Falls back to direct Anthropic ("basic mode") if unreachabl
 from __future__ import annotations
 
 import asyncio
-import audioop  # stdlib SRC for local Piper TTS 22050->16000 (audioop-lts on py3.13+)
 import json
 import os
 import re
@@ -369,15 +368,26 @@ class VoicePipelineServer:
                 if segment.text.strip()
             ).strip()
 
+        # Near-silent / speechless audio legitimately makes whisper raise; that
+        # is an empty transcript, not a failure. Anything else (model load,
+        # onnxruntime crash, OOM, decode error) must NOT be silently turned into
+        # "" — that is indistinguishable from a silent mic and defeats turn-log
+        # diagnosis. Record it and re-raise so _run_turn reports a real error.
+        benign = ("no clip timestamps", "no active speech", "no speech")
         try:
             async with self.stt_lock:
                 text = await asyncio.to_thread(run_whisper)
         except Exception as exc:
-            print(
-                f"direct faster-whisper STT error: {exc}",
-                flush=True,
-            )
-            text = ""
+            if any(s in str(exc).lower() for s in benign):
+                print(f"local STT: no speech detected ({exc})", flush=True)
+                if timing:
+                    timing.stt_final_monotonic = time.perf_counter()
+                return ""
+            print(f"direct faster-whisper STT error: {exc}", flush=True)
+            if timing:
+                timing.errors.append(f"stt_failed: {type(exc).__name__}: {exc}")
+                timing.stt_final_monotonic = time.perf_counter()
+            raise
 
         if timing:
             timing.stt_final_monotonic = time.perf_counter()
@@ -536,6 +546,20 @@ class VoicePipelineServer:
         src_sr = int(piper.config.sample_rate)
         out_sr = int(local.get("sample_rate_out", 16000))
         state = None  # audioop.ratecv filter state, carried across chunks of this sentence
+        if src_sr != out_sr:
+            # stdlib `audioop` was removed in Python 3.13; `pip install audioop-lts`
+            # restores it. Imported here so a missing shim only breaks local Piper
+            # resampling, never the whole server (typed chat, STT, HUD proxy).
+            try:
+                import audioop
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "Piper needs to resample "
+                    f"{src_sr}->{out_sr} Hz but the `audioop` module is missing "
+                    "(Python 3.13+ requires `pip install audioop-lts`). "
+                    "Set voice.local.sample_rate_out to the model's native rate "
+                    f"({src_sr}) to skip resampling."
+                ) from exc
         for chunk in piper.synthesize(text):
             pcm = chunk.audio_int16_bytes
             if not pcm:
@@ -1561,7 +1585,10 @@ async def _cancel_active_turn(ws: WebSocket, pipeline: VoicePipelineServer, conn
     if stop_remote and run_id and turn_was_active:
         conn.current_run_id = None
         try:
-            res = await asyncio.to_thread(pipeline.hermes.stop_run, run_id)
+            # HERMES (module global), not pipeline.hermes: the STT pipeline may
+            # not be initialised yet on a lazy connection, and the API client
+            # is independent of it anyway.
+            res = await asyncio.to_thread(HERMES.stop_run, run_id)
             # 404 = session runs not in the runs registry on this Hermes build;
             # dropping the SSE stream (above) still cuts the turn off.
             msg = "Run halted." if res["status_code"] in (200, 202, 404) else f"Stop returned {res['status_code']}."
@@ -1649,7 +1676,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                         "approved": decision == "allow",
                         "approval_id": event.get("approval_id"),
                     }
-                    res = await asyncio.to_thread(pipeline.hermes.post_approval, run_id, body)
+                    res = await asyncio.to_thread(HERMES.post_approval, run_id, body)
                     await ws.send_json({"type": "status", "message": f"Approval sent ({res['status_code']})."})
                 else:
                     await ws.send_json({"type": "error", "message": f"Unknown event type: {etype}"})
@@ -1665,12 +1692,17 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         WS_CLIENTS.discard(ws)
 
 
-def _security_startup_check(host: str) -> None:
+def _security_startup_check(host: str, label: str = "") -> None:
     """F3: fail closed (or warn loudly) when the server is network-exposed with
-    no HUD token. `security.require_token: true` makes it a hard error."""
+    no HUD token. `security.require_token: true` makes it a hard error.
+
+    Call once per distinct bind address — the plaintext listener (server.plain_host)
+    serves the same unauthenticated /api surface as the TLS ones and must not be
+    able to opt out of this check by differing from server.host."""
     sec = CFG.get("security") or {}
     token = hud_token()
     loopback = host in ("127.0.0.1", "localhost", "::1")
+    where = f" ({label})" if label else ""
     if token:
         return
     if sec.get("require_token"):
@@ -1680,7 +1712,7 @@ def _security_startup_check(host: str) -> None:
         )
     if not loopback:
         print("=" * 72, flush=True)
-        print("SECURITY WARNING: no HUD token set and the server binds a non-loopback", flush=True)
+        print(f"SECURITY WARNING: no HUD token set and the server binds a non-loopback{where}", flush=True)
         print(f"  address ({host}). The /api surface, /api/say, and the dashboard proxy", flush=True)
         print("  are OPEN to anyone on the LAN. Set JARVIS_HUD_TOKEN (see server.yaml", flush=True)
         print("  security.hud_token_env) or set security.require_token: true.", flush=True)
@@ -1693,6 +1725,8 @@ def main() -> int:
     plain_host = server.get("plain_host", host)
     port = int(server.get("port", 8765))
     _security_startup_check(host)
+    if plain_host != host:
+        _security_startup_check(plain_host, "plain_host — UNENCRYPTED listener")
     tls_ports = server.get("tls_ports") or ([server["tls_port"]] if server.get("tls_port") else [])
     cert = server.get("tls_cert")
     key = server.get("tls_key")

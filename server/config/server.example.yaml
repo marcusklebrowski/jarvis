@@ -59,6 +59,11 @@ usage:
 server:
   host: 0.0.0.0              # wildcard bind (required for non-root port 443 on macOS)
   port: 8765                 # plain ws:// for the Python push-to-talk client
+  # plain_host: 127.0.0.1    # optional: bind ONLY the plaintext `port` listener
+  #                          # somewhere else than `host`. This listener is
+  #                          # UNENCRYPTED and serves the full /api surface — the
+  #                          # startup security check is applied to it separately,
+  #                          # so a non-loopback value still needs a HUD token.
   tls_ports: [443, 8766]     # https/wss for the HUD (browser mic requires TLS)
   tls_cert: certs/cert.pem
   tls_key: certs/key.pem
