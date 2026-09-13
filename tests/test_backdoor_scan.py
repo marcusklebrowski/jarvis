@@ -20,11 +20,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PROD_DIRS = ["server", "client", "worker", "hermes-plugin"]
 
 
+# Directory names that are never our own production source. A plain
+# `"venv" not in p.parts` misses the conventional dot-prefixed `.venv`, which
+# silently pulled every installed third-party package into the scan (torch,
+# sympy, wheel, ... all legitimately contain eval/exec/pickle and reach out to
+# github.com), drowning the real signal in false positives.
+SKIP_PARTS = {"venv", ".venv", "site-packages", "node_modules", "__pycache__"}
+
+
 def _prod_files(*suffixes):
     out = []
     for d in PROD_DIRS:
         for p in (REPO_ROOT / d).rglob("*"):
-            if p.is_file() and p.suffix in suffixes and "venv" not in p.parts:
+            if p.is_file() and p.suffix in suffixes and not SKIP_PARTS.intersection(p.parts):
                 out.append(p)
     return out
 
@@ -89,6 +97,9 @@ HOST_ALLOW = {
     "127.0.0.1", "0.0.0.0", "localhost",
     "jarvis.local", "jarvis", "this-machine",
     "api.elevenlabs.io",
+    "api.open-meteo.com",      # HUD weather panel (keyless, opt-in via config)
+    "huggingface.co",          # Piper voice download, documented in the example
+                               # config only - never fetched by the server itself
     "www.youtube.com", "youtu.be", "youtube.com",
     "fonts.googleapis.com", "fonts.gstatic.com",
     "www.w3.org",              # SVG/XML namespace URIs, not fetched

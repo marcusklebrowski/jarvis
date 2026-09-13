@@ -4,6 +4,8 @@ TestClient (full middleware + routing stack, no network to Hermes/ElevenLabs).
 
 from __future__ import annotations
 
+import socket
+
 
 # --------------------------------------------------------------------------- #
 # HTTP auth middleware (/api/*)                                                #
@@ -40,9 +42,17 @@ def test_chat_rejects_empty_input(no_token, client):
     assert r.json()["error"] == "empty input"
 
 
-def test_chat_backend_unreachable_is_graceful_502(no_token, client):
-    # Hermes is not running in tests -> endpoint must fail closed with 502,
-    # never a 500 stack trace or a hang.
+def test_chat_backend_unreachable_is_graceful_502(monkeypatch, no_token, client):
+    # An unreachable Hermes must fail closed with 502, never a 500 stack trace
+    # or a hang. Point the client at a port nothing listens on rather than
+    # assuming the configured one is dead: on a machine that also *runs* Jarvis
+    # (the normal case for this repo) the configured Hermes answers for real,
+    # so this asserted against production and failed with 200 != 502.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead_port = s.getsockname()[1]
+    monkeypatch.setitem(no_token.HERMES.cfg, "base_url", f"http://127.0.0.1:{dead_port}")
+
     r = client.post("/api/chat", json={"input": "hello"})
     assert r.status_code == 502
     assert "error" in r.json()

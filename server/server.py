@@ -41,7 +41,7 @@ from anthropic import Anthropic
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from RealtimeSTT import AudioToTextRecorder
+from faster_whisper import WhisperModel
 
 try:
     import psutil
@@ -302,25 +302,24 @@ class VoicePipelineServer:
         self.turn_counter = 0
         self.hermes = HermesAPI(cfg)
         self.stt_lock = asyncio.Lock()
-        self.recorder = AudioToTextRecorder(
-            model=cfg["stt"]["model"],
-            use_microphone=False,
-            spinner=False,
-            device=cfg["stt"].get("device", "cpu"),
-            compute_type=cfg["stt"].get("compute_type", "int8"),
-            sample_rate=int(cfg["stt"].get("sample_rate", 16000)),
-            # Was hardcoded to "en" regardless of the configured (often
-            # multilingual) model, silently mistranscribing any other spoken
-            # language. Now configurable via stt.language in config.yaml (any
-            # RealtimeSTT/Whisper language code, e.g. "pt", "es"); if unset,
-            # defaults to "" — RealtimeSTT's own auto-detect, matching what a
-            # multilingual model is actually for instead of silently forcing
-            # English.
-            language=cfg["stt"].get("language") or "",
-            beam_size=1,
-            faster_whisper_vad_filter=False,
-            no_log_file=True,
+
+        stt_cfg = cfg["stt"]
+
+        print(
+            "Loading direct faster-whisper model "
+            f"{stt_cfg['model']} on {stt_cfg.get('device', 'cpu')} ...",
+            flush=True,
         )
+
+        self.whisper_model = WhisperModel(
+            stt_cfg["model"],
+            device=stt_cfg.get("device", "cpu"),
+            compute_type=stt_cfg.get("compute_type", "int8"),
+            cpu_threads=int(stt_cfg.get("cpu_threads", 4)),
+            num_workers=1,
+        )
+
+        print("Direct faster-whisper model ready.", flush=True)
 
     def next_turn_id(self) -> int:
         self.turn_counter += 1
@@ -338,21 +337,61 @@ class VoicePipelineServer:
                     timing.stt_model = f"remote:{remote.get('name', 'gpu')}"
                     timing.stt_final_monotonic = time.perf_counter()
                 return text
-        # 2) local Whisper fallback
+        # 2) local direct faster-whisper fallback
         sample_rate = int(self.cfg["stt"].get("sample_rate", 16000))
-        samples = (np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0).copy()
+
+        if sample_rate != 16000:
+            raise RuntimeError(
+                f"Direct STT expects 16000 Hz PCM, got {sample_rate}"
+            )
+
+        samples = (
+            np.frombuffer(audio, dtype=np.int16)
+            .astype(np.float32) / 32768.0
+        ).copy()
+
+        def run_whisper() -> str:
+            language = self.cfg["stt"].get("language") or None
+
+            segments, _info = self.whisper_model.transcribe(
+                samples,
+                language=language,
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                temperature=0.0,
+            )
+
+            return " ".join(
+                segment.text.strip()
+                for segment in segments
+                if segment.text.strip()
+            ).strip()
+
+        # Near-silent / speechless audio legitimately makes whisper raise; that
+        # is an empty transcript, not a failure. Anything else (model load,
+        # onnxruntime crash, OOM, decode error) must NOT be silently turned into
+        # "" — that is indistinguishable from a silent mic and defeats turn-log
+        # diagnosis. Record it and re-raise so _run_turn reports a real error.
+        benign = ("no clip timestamps", "no active speech", "no speech")
         try:
             async with self.stt_lock:
-                self.recorder.feed_audio(samples, original_sample_rate=sample_rate)
-                text = await asyncio.to_thread(self.recorder.perform_final_transcription, samples, True)
-                self.recorder.clear_audio_queue()
+                text = await asyncio.to_thread(run_whisper)
         except Exception as exc:
-            # near-silent audio can make whisper raise ("No clip timestamps found");
-            # treat as empty transcript instead of failing the turn
-            print(f"local STT error treated as empty transcript: {exc}", flush=True)
-            text = ""
+            if any(s in str(exc).lower() for s in benign):
+                print(f"local STT: no speech detected ({exc})", flush=True)
+                if timing:
+                    timing.stt_final_monotonic = time.perf_counter()
+                return ""
+            print(f"direct faster-whisper STT error: {exc}", flush=True)
+            if timing:
+                timing.errors.append(f"stt_failed: {type(exc).__name__}: {exc}")
+                timing.stt_final_monotonic = time.perf_counter()
+            raise
+
         if timing:
             timing.stt_final_monotonic = time.perf_counter()
+
         return (text or "").strip()
 
     def _remote_stt(self, audio: bytes, remote: dict) -> str | None:
@@ -444,11 +483,51 @@ class VoicePipelineServer:
 
     # ------------------------------------------------------------------ TTS
 
-    def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
+    def _tts_key(self) -> str | None:
+        return (
+            os.environ.get("ELEVENLABS_API_KEY")
+            or os.environ.get("ELEVEN_API_KEY")
+            or os.environ.get("XI_API_KEY")
+        )
+
+    def tts_backend(self) -> str:
+        """Which TTS path this turn will take: 'elevenlabs' | 'piper' |
+        'text-only' (deliberate) | 'unconfigured' (probably a mistake)."""
         voice = self.cfg["voice"]
-        key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY") or os.environ.get("XI_API_KEY")
-        if not key:
-            raise RuntimeError("ElevenLabs API key not found")
+        vid = voice.get("voice_id")
+        if self._tts_key() and vid and vid not in ("NOT_CONFIGURED", "YOUR_ELEVENLABS_VOICE_ID", ""):
+            return "elevenlabs"
+        local = voice.get("local") or {}
+        if local.get("engine") == "piper" and local.get("model"):
+            return "piper"
+        return "text-only" if voice.get("text_only") else "unconfigured"
+
+    def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
+        """Yield 16 kHz mono int16 PCM for `text`. ElevenLabs when it has a
+        usable key + voice_id, else local Piper when configured, else nothing
+        (text-only mode)."""
+        voice = self.cfg["voice"]
+        backend = self.tts_backend()
+        if backend == "elevenlabs":
+            yield from self._tts_elevenlabs(text, timing, self._tts_key())
+            return
+        if backend == "piper":
+            yield from self._tts_piper(text, timing, voice["local"])
+            return
+        # No audio this turn. Make it visible instead of a silent no-op: the HUD
+        # otherwise shows "speaking" and plays nothing, and the turn log looks
+        # like a normal spoken turn.
+        if backend == "text-only":
+            timing.tts_model = timing.tts_model or "none:text-only"
+        else:
+            timing.tts_model = timing.tts_model or "none:unconfigured"
+            if "tts_unconfigured" not in timing.errors:
+                timing.errors.append("tts_unconfigured")
+            _warn_tts_unconfigured(bool(self._tts_key()), voice.get("voice_id"))
+        return
+
+    def _tts_elevenlabs(self, text: str, timing: TurnTiming, key: str) -> Iterator[bytes]:
+        voice = self.cfg["voice"]
         timing.tts_model = voice["model"]
         timing.voice_id = voice["voice_id"]
         timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
@@ -481,6 +560,42 @@ class VoicePipelineServer:
         finally:
             response.close()  # barge-in cancels mid-stream; don't leak the connection
 
+    def _tts_piper(self, text: str, timing: TurnTiming, local: dict) -> Iterator[bytes]:
+        """On-device Piper TTS. Model loads once (lazy singleton). Native rate is
+        22050 Hz -> resampled to sample_rate_out (16000) so the HUD plays it
+        unchanged."""
+        timing.tts_model = f"piper:{Path(local['model']).stem}"
+        timing.voice_id = "local"
+        timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
+        record_usage(tts_chars=len(text))
+        piper = _get_piper_voice(local)
+        src_sr = int(piper.config.sample_rate)
+        out_sr = int(local.get("sample_rate_out", 16000))
+        state = None  # audioop.ratecv filter state, carried across chunks of this sentence
+        if src_sr != out_sr:
+            # stdlib `audioop` was removed in Python 3.13; `pip install audioop-lts`
+            # restores it. Imported here so a missing shim only breaks local Piper
+            # resampling, never the whole server (typed chat, STT, HUD proxy).
+            try:
+                import audioop
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "Piper needs to resample "
+                    f"{src_sr}->{out_sr} Hz but the `audioop` module is missing "
+                    "(Python 3.13+ requires `pip install audioop-lts`). "
+                    "Set voice.local.sample_rate_out to the model's native rate "
+                    f"({src_sr}) to skip resampling."
+                ) from exc
+        for chunk in piper.synthesize(text):
+            pcm = chunk.audio_int16_bytes
+            if not pcm:
+                continue
+            if src_sr != out_sr:
+                pcm, state = audioop.ratecv(pcm, 2, 1, src_sr, out_sr, state)
+            if timing.first_tts_audio_byte_monotonic is None:
+                timing.first_tts_audio_byte_monotonic = time.perf_counter()
+            yield pcm
+
     # ------------------------------------------------------------- Turn flow
 
     def _ack_config(self) -> tuple[float, str | None]:
@@ -500,6 +615,14 @@ class VoicePipelineServer:
         full_response: list[str] = []
         spoken = False
         await ws.send_json({"type": "agent_status", "state": "thinking"})
+
+        backend = self.tts_backend()
+        if backend in ("text-only", "unconfigured"):
+            await ws.send_json({"type": "status", "message": (
+                "Text-only mode - no speech output configured."
+                if backend == "unconfigured"
+                else "Text-only mode."
+            )})
 
         q: asyncio.Queue = asyncio.Queue()
         tts_lock = asyncio.Lock()  # serialise ack vs real sentences (no interleaved PCM)
@@ -667,8 +790,79 @@ CFG = load_config()
 HERMES = HermesAPI(CFG)   # lightweight API client - independent of the STT pipeline
 PIPELINE: VoicePipelineServer | None = None
 
+# Hard ceiling on a single spoken turn. Without it a client can stream unbounded
+# PCM and pin a CPU core in Whisper (STT is serialised on one worker). 16 kHz
+# mono int16 = 32000 bytes/s.
+MAX_UTTERANCE_SECONDS = float((CFG.get("stt") or {}).get("max_utterance_seconds", 120))
+MAX_UTTERANCE_BYTES = int(16000 * 2 * MAX_UTTERANCE_SECONDS)
+
+_TTS_UNCONFIGURED_WARNED = False
+
+
+def _warn_tts_unconfigured(has_key: bool, voice_id: object) -> None:
+    """Log once per process when a turn produced no speech because no TTS
+    backend is usable — as opposed to a deliberate `voice.text_only: true`."""
+    global _TTS_UNCONFIGURED_WARNED
+    if _TTS_UNCONFIGURED_WARNED:
+        return
+    _TTS_UNCONFIGURED_WARNED = True
+    reason = (
+        f"ElevenLabs key is set but voice.voice_id is missing/placeholder ({voice_id!r})"
+        if has_key else
+        "no ElevenLabs API key and no voice.local.engine=piper configured"
+    )
+    print(
+        f"TTS NOT CONFIGURED - running TEXT-ONLY: {reason}. "
+        "Set voice.text_only: true to make this the intended mode and silence this warning.",
+        flush=True,
+    )
+
 
 _PIPELINE_LOCK = threading.Lock()
+
+_PIPER_VOICE = None            # piper.PiperVoice, lazily loaded on first local TTS
+_PIPER_LOAD_FAILED: str | None = None  # cached hard failure — don't re-attempt every turn
+_PIPER_LOCK = threading.Lock()
+
+
+def _get_piper_voice(local: dict):
+    """Load the Piper ONNX voice once and reuse it. ~150-250 MB RSS, ~1-2 s the
+    first time; never loads unless local TTS is actually used. A hard load
+    failure (missing package, missing/corrupt model, missing espeak data) is
+    cached so every later turn fails fast with a clear message instead of
+    re-incurring the 1-2 s load attempt each time."""
+    global _PIPER_VOICE, _PIPER_LOAD_FAILED
+    if _PIPER_VOICE is not None:
+        return _PIPER_VOICE
+    if _PIPER_LOAD_FAILED is not None:
+        raise RuntimeError(f"Piper TTS unavailable: {_PIPER_LOAD_FAILED}")
+    with _PIPER_LOCK:
+        if _PIPER_VOICE is not None:
+            return _PIPER_VOICE
+        if _PIPER_LOAD_FAILED is not None:
+            raise RuntimeError(f"Piper TTS unavailable: {_PIPER_LOAD_FAILED}")
+        try:
+            from piper import PiperVoice
+            model_path = Path(local["model"])
+            if not model_path.is_absolute():
+                model_path = ROOT / model_path
+            if not model_path.exists():
+                raise FileNotFoundError(f"Piper model not found: {model_path}")
+            kwargs = {}
+            if local.get("espeak_data_dir"):
+                kwargs["espeak_data_dir"] = local["espeak_data_dir"]
+            print(f"Loading Piper TTS voice {model_path.name} ...", flush=True)
+            _PIPER_VOICE = PiperVoice.load(str(model_path), **kwargs)
+            print("Piper TTS voice ready.", flush=True)
+        except Exception as exc:
+            _PIPER_LOAD_FAILED = f"{type(exc).__name__}: {exc}"
+            print(
+                f"Piper TTS load failed — local TTS disabled for this process: "
+                f"{_PIPER_LOAD_FAILED}",
+                flush=True,
+            )
+            raise
+    return _PIPER_VOICE
 
 
 def get_pipeline() -> VoicePipelineServer:
@@ -712,6 +906,12 @@ async def warm_pipeline() -> None:
     hook fires once per uvicorn listener — there are four), and never let a
     warm failure take a listener down."""
     global _WARM_STARTED
+    if not (CFG.get("stt") or {}).get("warm_on_startup", True):
+        print(
+            "STT startup warm disabled; voice pipeline will load on first voice turn.",
+            flush=True,
+        )
+        return
     if _WARM_STARTED:
         return
     _WARM_STARTED = True
@@ -1046,6 +1246,7 @@ async def speak_broadcast(text: str, *, priority: str = "normal", panel: dict | 
             loop.call_soon_threadsafe(q.put_nowait, exc)
 
     worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    audio_bytes = 0
     try:
         while True:
             item = await q.get()
@@ -1053,6 +1254,7 @@ async def speak_broadcast(text: str, *, priority: str = "normal", panel: dict | 
                 break
             if isinstance(item, Exception):
                 raise item
+            audio_bytes += len(item)
             await _broadcast_bytes(item)
         await worker_task
     finally:
@@ -1061,6 +1263,10 @@ async def speak_broadcast(text: str, *, priority: str = "normal", panel: dict | 
         timing.total_done_monotonic = time.perf_counter()
         await _broadcast_json({"type": "speak_end", "id": spk_id})
         pipeline.log_turn(timing)
+    if audio_bytes == 0:
+        # No TTS backend produced audio - don't claim we spoke.
+        return {"spoke": False, "sent_to": n, "chars": len(clean),
+                "reason": timing.tts_model or "no tts audio produced"}
     return {"spoke": True, "id": spk_id, "sent_to": n, "chars": len(clean)}
 
 
@@ -1401,6 +1607,7 @@ async def dash_http_proxy(path: str, request: Request) -> Response:
 @dataclass
 class ConnState:
     audio_chunks: list = field(default_factory=list)
+    audio_bytes: int = 0        # running size of audio_chunks this turn (cap guard)
     recording: bool = False
     timing: TurnTiming | None = None
     turn_task: asyncio.Task | None = None
@@ -1417,6 +1624,10 @@ async def _run_turn(ws: WebSocket, pipeline: VoicePipelineServer, conn: ConnStat
     assert timing is not None
     audio = b"".join(conn.audio_chunks)
     conn.audio_chunks = []
+    conn.audio_bytes = 0
+    if len(audio) > MAX_UTTERANCE_BYTES:  # defence in depth; the WS handler also caps
+        audio = audio[:MAX_UTTERANCE_BYTES]
+        timing.errors.append(f"audio truncated to {MAX_UTTERANCE_SECONDS:.0f}s")
     try:
         transcript = await pipeline.transcribe(audio, timing)
         timing.transcript = transcript
@@ -1467,7 +1678,10 @@ async def _cancel_active_turn(ws: WebSocket, pipeline: VoicePipelineServer, conn
     if stop_remote and run_id and turn_was_active:
         conn.current_run_id = None
         try:
-            res = await asyncio.to_thread(pipeline.hermes.stop_run, run_id)
+            # HERMES (module global), not pipeline.hermes: the STT pipeline may
+            # not be initialised yet on a lazy connection, and the API client
+            # is independent of it anyway.
+            res = await asyncio.to_thread(HERMES.stop_run, run_id)
             # 404 = session runs not in the runs registry on this Hermes build;
             # dropping the SSE stream (above) still cuts the turn off.
             msg = "Run halted." if res["status_code"] in (200, 202, 404) else f"Stop returned {res['status_code']}."
@@ -1484,13 +1698,19 @@ def _maybe_schedule_partial(ws: WebSocket, pipeline: VoicePipelineServer, conn: 
         return
     buf = b"".join(conn.audio_chunks)
     min_new = int(16000 * 2 * float(stt_cfg.get("partial_interval", 1.2)))
-    if len(buf) < 16000 or len(buf) - conn.last_partial_bytes < min_new or len(buf) > 16000 * 2 * 30:
+    if len(buf) < 16000 or len(buf) - conn.last_partial_bytes < min_new:
         return
     conn.last_partial_bytes = len(buf)
+    # Partials are a throwaway live hint. Decode only the trailing window instead
+    # of the whole growing buffer, so cost stays flat rather than O(n^2) as the
+    # utterance grows (direct faster-whisper keeps no incremental state). The
+    # final transcription at `stop` still sees the full audio.
+    window = int(16000 * 2 * float(stt_cfg.get("partial_window_seconds", 15)))
+    chunk = buf[-window:] if len(buf) > window else buf
 
     async def run() -> None:
         try:
-            text = await pipeline.transcribe(buf)
+            text = await pipeline.transcribe(chunk)
             if text and conn.recording:
                 await ws.send_json({"type": "partial_transcript", "text": text})
         except Exception:
@@ -1506,7 +1726,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         return
     await ws.accept()
     WS_CLIENTS.add(ws)
-    pipeline = get_pipeline()
+    # Do not initialise local Whisper merely because a HUD browser connects.
+    # On Intel macOS this can be expensive and must never block typed chat.
+    pipeline = None
     conn = ConnState(conversation=(CFG.get("hermes") or {}).get("conversation", "jarvis-main"))
     await ws.send_json({"type": "status", "message": "Hermes voice server connected."})
     try:
@@ -1516,10 +1738,26 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 event = json.loads(message["text"])
                 etype = event.get("type")
                 if etype == "start":
+                    if pipeline is None:
+                        await ws.send_json({
+                            "type": "status",
+                            "message": "Loading local speech recognition..."
+                        })
+                        try:
+                            pipeline = await asyncio.to_thread(get_pipeline)
+                        except Exception as exc:
+                            # Model init failed (bad stt.model, no disk, CT2 error).
+                            # Keep the socket alive — typed chat needs no STT — and
+                            # let a later `start` retry.
+                            print(f"STT pipeline init failed: {exc}", flush=True)
+                            await ws.send_json({"type": "error", "message":
+                                f"Speech recognition failed to load: {exc}"})
+                            continue
                     await _cancel_active_turn(ws, pipeline, conn)  # barge-in
                     if event.get("conversation"):
                         conn.conversation = str(event["conversation"])
                     conn.audio_chunks = []
+                    conn.audio_bytes = 0
                     conn.last_partial_bytes = 0
                     conn.recording = True
                     conn.timing = TurnTiming(turn_id=pipeline.next_turn_id())
@@ -1530,6 +1768,8 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     if conn.timing is None:
                         await ws.send_json({"type": "error", "message": "Received stop before start."})
                         continue
+                    if conn.turn_task and not conn.turn_task.done():
+                        continue  # turn already running (e.g. max-utterance cap fired)
                     conn.recording = False
                     conn.timing.end_of_speech_monotonic = time.perf_counter()
                     conn.turn_task = asyncio.create_task(_run_turn(ws, pipeline, conn))
@@ -1547,14 +1787,25 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                         "approved": decision == "allow",
                         "approval_id": event.get("approval_id"),
                     }
-                    res = await asyncio.to_thread(pipeline.hermes.post_approval, run_id, body)
+                    res = await asyncio.to_thread(HERMES.post_approval, run_id, body)
                     await ws.send_json({"type": "status", "message": f"Approval sent ({res['status_code']})."})
                 else:
                     await ws.send_json({"type": "error", "message": f"Unknown event type: {etype}"})
             elif "bytes" in message and message["bytes"] is not None:
                 if conn.recording:
                     conn.audio_chunks.append(message["bytes"])
-                    _maybe_schedule_partial(ws, pipeline, conn)
+                    conn.audio_bytes += len(message["bytes"])
+                    if conn.audio_bytes >= MAX_UTTERANCE_BYTES:
+                        # Force the turn instead of buffering without bound.
+                        conn.recording = False
+                        conn.timing.end_of_speech_monotonic = time.perf_counter()
+                        await ws.send_json({"type": "status", "message": (
+                            f"Max utterance length ({MAX_UTTERANCE_SECONDS:.0f}s) reached "
+                            "- processing what was captured."
+                        )})
+                        conn.turn_task = asyncio.create_task(_run_turn(ws, pipeline, conn))
+                    else:
+                        _maybe_schedule_partial(ws, pipeline, conn)
     except WebSocketDisconnect:
         if conn.turn_task and not conn.turn_task.done():
             conn.turn_task.cancel()
@@ -1563,12 +1814,17 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         WS_CLIENTS.discard(ws)
 
 
-def _security_startup_check(host: str) -> None:
+def _security_startup_check(host: str, label: str = "") -> None:
     """F3: fail closed (or warn loudly) when the server is network-exposed with
-    no HUD token. `security.require_token: true` makes it a hard error."""
+    no HUD token. `security.require_token: true` makes it a hard error.
+
+    Call once per distinct bind address — the plaintext listener (server.plain_host)
+    serves the same unauthenticated /api surface as the TLS ones and must not be
+    able to opt out of this check by differing from server.host."""
     sec = CFG.get("security") or {}
     token = hud_token()
     loopback = host in ("127.0.0.1", "localhost", "::1")
+    where = f" ({label})" if label else ""
     if token:
         return
     if sec.get("require_token"):
@@ -1578,7 +1834,7 @@ def _security_startup_check(host: str) -> None:
         )
     if not loopback:
         print("=" * 72, flush=True)
-        print("SECURITY WARNING: no HUD token set and the server binds a non-loopback", flush=True)
+        print(f"SECURITY WARNING: no HUD token set and the server binds a non-loopback{where}", flush=True)
         print(f"  address ({host}). The /api surface, /api/say, and the dashboard proxy", flush=True)
         print("  are OPEN to anyone on the LAN. Set JARVIS_HUD_TOKEN (see server.yaml", flush=True)
         print("  security.hud_token_env) or set security.require_token: true.", flush=True)
@@ -1588,14 +1844,17 @@ def _security_startup_check(host: str) -> None:
 def main() -> int:
     server = CFG["server"]
     host = server.get("host", "0.0.0.0")
+    plain_host = server.get("plain_host", host)
     port = int(server.get("port", 8765))
     _security_startup_check(host)
+    if plain_host != host:
+        _security_startup_check(plain_host, "plain_host — UNENCRYPTED listener")
     tls_ports = server.get("tls_ports") or ([server["tls_port"]] if server.get("tls_port") else [])
     cert = server.get("tls_cert")
     key = server.get("tls_key")
-    print(f"Starting Hermes voice server on ws://{host}:{port}/ws", flush=True)
+    print(f"Starting Hermes voice server on ws://{plain_host}:{port}/ws", flush=True)
     if tls_ports and cert and key and (ROOT / cert).exists() and (ROOT / key).exists():
-        servers = [uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))]
+        servers = [uvicorn.Server(uvicorn.Config(app, host=plain_host, port=port, log_level="info"))]
         for tp in tls_ports:
             print(f"HUD available on https://{host}:{tp}/hud/", flush=True)
             servers.append(uvicorn.Server(uvicorn.Config(

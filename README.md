@@ -110,15 +110,11 @@ hermes gateway   # or set up its LaunchAgent / service
 git clone https://github.com/YOURNAME/jarvis-hermes-hud
 cd jarvis-hermes-hud/server
 python3 -m venv .venv
-# CPU-only torch/torchaudio FIRST: a plain `pip install torch` pulls the
-# default CUDA build (several GB of nvidia-*/triton packages) even though
-# stt.device is "cpu" and this server has no GPU inference path — installing
-# the CPU wheel first satisfies RealtimeSTT's torch dependency before pip
-# would otherwise reach for the CUDA default. Skip this line if you actually
-# have an NVIDIA GPU and want CUDA-accelerated STT.
-.venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# STT is direct faster-whisper (CTranslate2) — no torch, no RealtimeSTT, no
+# silero-vad. Optional on-device TTS fallback: also `pip install piper-tts
+# onnxruntime` (and `audioop-lts` on Python 3.13+). See docs/SETUP.md.
 .venv/bin/pip install fastapi uvicorn requests pyyaml numpy anthropic \
-    RealtimeSTT faster-whisper silero-vad websockets psutil
+    faster-whisper websockets psutil
 cp config/server.example.yaml config/server.yaml   # edit: your ElevenLabs voice_id etc.
 scripts/make-certs.sh                              # self-signed TLS (browser mic needs it)
 scripts/make-boot-audio.sh YourName                # one-time boot greeting synthesis
@@ -172,8 +168,8 @@ docs/            SETUP, ARCHITECTURE (protocols/endpoints), TROUBLESHOOTING
 Built on [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous
 Research. HUD aesthetics inspired by
 [jarvis-dashboard](https://github.com/AndrewKochulab/jarvis-dashboard).
-STT by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) /
-[RealtimeSTT](https://github.com/KoljaB/RealtimeSTT). Voice by
-[ElevenLabs](https://elevenlabs.io).
+STT by [faster-whisper](https://github.com/SYSTRAN/faster-whisper). Voice by
+[ElevenLabs](https://elevenlabs.io), with an optional on-device
+[Piper](https://github.com/OHF-Voice/piper1-gpl) fallback.
 
 MIT — see [LICENSE](LICENSE). Use it, fork it, build your own Jarvis.

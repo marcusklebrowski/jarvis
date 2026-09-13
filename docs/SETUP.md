@@ -49,18 +49,24 @@ For the HUD's quota bar, give the key the **User → Read** permission.
 ```bash
 cd server
 python3 -m venv .venv
-# CPU-only torch/torchaudio first — see README's "Install" section for why
-# (plain `pip install torch` pulls several GB of unused CUDA packages).
-.venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install fastapi uvicorn requests pyyaml numpy anthropic \
-    RealtimeSTT faster-whisper silero-vad websockets psutil
+    faster-whisper websockets psutil
 cp config/server.example.yaml config/server.yaml
 ```
 
-Note: `faster-whisper` and `silero-vad` are REQUIRED — recent RealtimeSTT
-releases treat them as optional extras and fail at runtime without them
-(silently for VAD, loudly for the engine). The first start takes 60–90 s
-(torch import + model download); subsequent starts are faster.
+STT is direct [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+(CTranslate2 — no torch, no RealtimeSTT, no silero-vad). The first start
+downloads the Whisper model; subsequent starts are fast.
+
+Optional on-device TTS fallback (used only when ElevenLabs has no usable
+key + `voice.voice_id`, otherwise the server runs text-only):
+
+```bash
+.venv/bin/pip install piper-tts onnxruntime   # onnxruntime>=1.23 on macOS x86_64
+.venv/bin/pip install "audioop-lts; python_version >= '3.13'"   # stdlib audioop shim
+# then download a voice from https://huggingface.co/rhasspy/piper-voices
+# and fill in voice.local in server.yaml
+```
 
 Edit `config/server.yaml`: set `voice.voice_id`, and adjust the `machines:`
 list (or delete it). The first run downloads the Whisper model (~460 MB for
